@@ -1,8 +1,40 @@
 #!/usr/bin/env python
 
 import subprocess
+import sys
+import os
+
+try:
+    from gi import require_version
+    require_version('Notify', '0.7')
+    from gi.repository import Notify
+except ImportError as e:
+    sys.stderr.write('{}\n'.format(e.msg))
+    sys.stderr.flush()
 
 RESCAN_NETWORKS = 'Netzwerke scannen'
+DMENU_OPS = os.getenv('DMENU_DEFAULT_OPS', default='').split()
+
+
+class catchProcError():
+    def __init__(self, cmdname):
+        self.cmdname = cmdname
+
+    def __call__(self, f):
+        def wrapped_f(*args, **kwargs):
+            try:
+                return f(*args, **kwargs)
+            except subprocess.CalledProcessError as e:
+                exit_with_msg(
+                    'Error running command {}.\n{}'.format(
+                        self.cmdname, e.stderr))
+        return wrapped_f
+
+
+def exit_with_msg(msg):
+    sys.stderr.write(msg)
+    sys.stderr.flush()
+    exit(1)
 
 
 def populate_entry(entry):
@@ -15,8 +47,8 @@ def populate_entry(entry):
 
 def add_output_entry(nw_list):
     """Add a unique out_entry to every entry in nw_list."""
-    # we also need to make sure there's no network that has RESCAN_NETWORKS as
-    # its ssid (however unlikely that may be)
+    # also make sure there's no network that has RESCAN_NETWORKS as its ssid
+    # (however unlikely that may be)
     out_entries = [RESCAN_NETWORKS]
     for e in nw_list:
         oe = create_uniq_output_entry(
@@ -46,41 +78,63 @@ def get_entry_from_out_entry(out_entry, nw_list):
     its out_entry key."""
     # next() will return the ONLY entry because we made sure each out_entry is
     # unique
-    return next(e for e in nw_list if e['out_entry'] == out_entry)
+    try:
+        return next(e for e in nw_list if e['out_entry'] == out_entry)
+    except StopIteration:
+        return RESCAN_NETWORKS
 
 
 def get_nw_list(nm_output):
     """Turn output into a list of strings."""
-    out = nm_output.decode('utf-8').strip('\n').split(sep='\n')
+    out = nm_output.strip('\n').split(sep='\n')
     nw_list = [populate_entry(e) for e in list(slice_up_list(out))]
     nw_list = add_output_entry(nw_list)
     return nw_list
 
 
-def get_nmcli_out(scan=None):
-    rescan = "yes" if scan else "no"
-    nmcli_out = subprocess.check_output(['nmcli', '-g',
-                                         'SSID,BSSID,FREQ,SECURITY', '--mode',
-                                         'multiline', 'device', 'wifi', 'list',
-                                         '--rescan', rescan],
-                                        stderr=subprocess.PIPE)
+@catchProcError('nmcli')
+def get_nmcli_out():
+    nmcli_out = subprocess.check_output(
+        ['nmcli', '-g', 'SSID,BSSID,FREQ,SECURITY', '--mode', 'multiline',
+         'device', 'wifi', 'list', '--rescan', 'no'], encoding='utf-8',
+        stderr=subprocess.PIPE)
     return nmcli_out
 
 
-def get_user_choice(entry_list):
-    """Return the network chosen by user via dmenu/rofi."""
-    entry_list.insert(0, RESCAN_NETWORKS)
-    printfp = subprocess.Popen(['printf', '%s\n', *entry_list],
-                               stdout=subprocess.PIPE)
-    printfp.wait()
-    dmenup = subprocess.Popen(['dmenu'], stdin=printfp.stdout,
-                              stdout=subprocess.PIPE, encoding='utf-8')
-    dmenup.wait()
-    return dmenup.stdout.read().rstrip('\n')
+@catchProcError('nmcli')
+def rescan_wifi_nw():
+    """Rescan wifi networks."""
+    subprocess.run(['nmcli', 'device', 'wifi', 'rescan'], check=True)
 
+
+def get_user_choice(entry_list):
+    """Return the network chosen by user via dmenu."""
+    entry_list.insert(0, RESCAN_NETWORKS)
+    dmenup = subprocess.Popen(['dmenu', *DMENU_OPS], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              encoding='utf-8')
+
+    stdout, stderr = dmenup.communicate(input='\n'.join(entry_list))
+    if dmenup.returncode == 0:
+        return stdout.rstrip('\n')
+    else:
+        exit_with_msg(
+            'Error running dmenu.\n{}\n{}'.format(stdout, stderr))
+
+
+def connect_to_nw(entry):
+    """Connect to the network specified in entry."""
+    pass
+    # entry['ssid']
+
+
+def process_dmenu_selection(sel):
+    if sel == RESCAN_NETWORKS:
+        rescan_wifi_nw()
+    else:
+        print(sel)
 
 if __name__ == '__main__':
     nwl = get_nw_list(get_nmcli_out())
     user_choice = get_user_choice([e['out_entry'] for e in nwl])
-    e = get_entry_from_out_entry(user_choice, nwl)
-    print(e)
+    process_dmenu_selection(user_choice)
